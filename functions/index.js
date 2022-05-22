@@ -5,6 +5,8 @@ import axios from "axios";
 import dotenv from "dotenv";
 import { https } from "firebase-functions";
 
+import fs from "fs";
+
 // CONSTANTS
 const PER_PAGE = 100;
 
@@ -111,14 +113,24 @@ async function sendCachedResults(username_fork_key, res) {
 }
 
 async function processReposData(repos, aggregateValues) {
+  console.log("^^^ processReposData");
+
   let { reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize, langList } =
     aggregateValues;
 
-  repos.forEach(async (repo) => {
+  console.log(typeof repos);
+  console.log(" * repos: ", repos);
+  console.log("\n");
+
+  for (const repo of repos) {
     reposCount += 1;
     stargazersTotalCount += repo["stargazers_count"];
     forksTotalCount += repo["forks_count"];
     totalRepoSize += repo["size"];
+
+    console.log('repo["stargazers_count"]: ', repo["stargazers_count"]);
+    console.log('repo["forks_count"]: ', repo["forks_count"]);
+    console.log('repo["size"]: ', repo["size"]);
 
     // Get languages
     const { data: languagesObj } = await axios({
@@ -133,6 +145,7 @@ async function processReposData(repos, aggregateValues) {
 
     // Populate langList by iterating through languesObj
     for (const [name, count] of Object.entries(languagesObj)) {
+      console.log("       * LOOP => (name, count): (" + name + ", " + count + ")");
       const langMatchIndex = langList.findIndex((lang) => lang.name === name);
 
       // language is not found in langList
@@ -149,23 +162,30 @@ async function processReposData(repos, aggregateValues) {
         langList.splice(langMatchIndex, 1, updatedLang);
       }
     }
-  }); // END OF repos.forEach()
+  } // END OF repos.forEach()
 
   return [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize];
 }
 
 async function processReposDataObj(reposDataObj, aggregateValues) {
+  console.log("^^^ processReposDataObj");
+
   const repos = reposDataObj.data;
-  return processReposData(repos, aggregateValues);
+  return await processReposData(repos, aggregateValues);
 }
 
-async function processCachedReposData(cachedEtag, aggregateValues) {
+async function processCachedReposData(username_fork_key, cachedEtag, aggregateValues) {
+  console.log("^^^ processCachedReposData");
+  
+  // TODO: problem with etag => HASH doesn't recognize etag, probably bc of the weird format
+  // TODO: when storing etags, strip the ""'s and \ and stuff 
+
   const cachedReposData = await redisClient
     .HGET(username_fork_key + "-" + "HASH", cachedEtag)
     .then((data) => JSON.parse(data))
     .catch((error) => console.error("REDIS ERROR: ", error));
 
-  return processReposData(cachedReposData, aggregateValues);
+  return await processReposData(cachedReposData, aggregateValues);
 }
 
 function getAvgRepoSize(totalRepoSize, reposCount) {
@@ -175,8 +195,12 @@ function getAvgRepoSize(totalRepoSize, reposCount) {
   // Convert into appropriate unit (KB, MB, GB)
   if (avgRepoSize >= 1000) {
     avgRepoSize = (avgRepoSize / 1000).toFixed(3); // MB
+    avgRepoSize = avgRepoSize + " MB";
   } else if (avgRepoSize >= 1000 * 1000) {
     avgRepoSize = (avgRepoSize / (1000 * 1000)).toFixed(3); // GB
+    avgRepoSize = avgRepoSize + " GB";
+  } else {
+    avgRepoSize = avgRepoSize + " KB";
   }
 
   return avgRepoSize;
@@ -192,11 +216,12 @@ async function renewAllCache(
   await redisClient
     .DEL(username_fork_key + "-" + "LIST")
     .catch((error) => console.error("REDIS ERROR: ", error));
-  newEtagsPageNumList.forEach(async (etagsPageNumPair) => {
+
+  for (const etagsPageNumPair of newEtagsPageNumList) {
     await redisClient
       .RPUSH(username_fork_key + "-" + "LIST", JSON.stringify(etagsPageNumPair))
       .catch((error) => console.error("REDIS ERROR: ", error));
-  });
+  }
 
   // renew etag: reposPage HASH
   await redisClient
@@ -259,7 +284,8 @@ app.get("/aggregated-stats", async (req, res) => {
   let prevPageNum = 0;
   if (cachedEtagsPageNumList.length != 0) {
     console.log("*** cachedEtagsPageNumList.length != 0");
-    cachedEtagsPageNumList.forEach(async (cachedEtagPageNum) => {
+
+    for (const cachedEtagPageNum of cachedEtagsPageNumList) {
       const cachedEtag = cachedEtagPageNum.split("=")[0];
       const cachedPageNum = cachedEtagPageNum.split("=")[1];
 
@@ -283,6 +309,7 @@ app.get("/aggregated-stats", async (req, res) => {
       // Check for 304: Not Modified
       let contentUpToDate = checkForNotModified(reposDataObj);
       if (!contentUpToDate) {
+        console.log("   * Content NOT up to date");
         allReposEntirelyUpToDate = false;
 
         // Prepare for update of redis cache
@@ -291,17 +318,18 @@ app.get("/aggregated-stats", async (req, res) => {
         newEachEtagPageHash[newEtag] = reposDataObj.data;
 
         // update aggregate data
-        [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] = processReposDataObj(
-          reposDataObj,
-          {
+        [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] =
+          await processReposDataObj(reposDataObj, {
             reposCount,
             stargazersTotalCount,
             forksTotalCount,
             totalRepoSize,
             langList,
-          }
-        );
+          });
       } else if (contentUpToDate) {
+        console.log("   * Content up to date");
+        console.log("   * Cached Etag: ", cachedEtag);
+
         // Prepare for update of redis cache
         newEtagsPageNumList.push([cachedEtag, cachedPageNum].join("="));
         newEachEtagPageHash[cachedEtag] = await redisClient
@@ -310,18 +338,16 @@ app.get("/aggregated-stats", async (req, res) => {
           .catch((error) => console.error("REDIS ERROR: ", error));
 
         // update aggregate data
-        [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] = processCachedReposData(
-          cachedEtag,
-          {
+        [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] =
+          await processCachedReposData(username_fork_key, cachedEtag, {
             reposCount,
             stargazersTotalCount,
             forksTotalCount,
             totalRepoSize,
             langList,
-          }
-        );
+          });
       }
-    }); // END OF cachedEtagsPageNumList.forEach()
+    } // END OF cachedEtagsPageNumList.forEach()
 
     // All repos across all pages are up to date. Everything can be returned from the cache
     if (allReposEntirelyUpToDate) {
@@ -338,20 +364,18 @@ app.get("/aggregated-stats", async (req, res) => {
 
           // Prepare for update of redis cache
           const newEtag = reposDataObj.headers.etag;
-          newEtagsPageNumList.push([newEtag, ""+i].join("="));
+          newEtagsPageNumList.push([newEtag, "" + i].join("="));
           newEachEtagPageHash[newEtag] = reposDataObj.data;
 
           // update aggregate data
-          [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] = processReposDataObj(
-            reposDataObj,
-            {
+          [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] =
+            await processReposDataObj(reposDataObj, {
               reposCount,
               stargazersTotalCount,
               forksTotalCount,
               totalRepoSize,
               langList,
-            }
-          );
+            });
         }
       }
     } // END OF allReposEntirelyUpToDate == false
@@ -376,7 +400,7 @@ app.get("/aggregated-stats", async (req, res) => {
     newEachEtagPageHash[newEtag] = reposDataObj.data;
 
     // update aggregate data
-    [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] = processReposDataObj(
+    [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] = await processReposDataObj(
       reposDataObj,
       {
         reposCount,
@@ -401,25 +425,27 @@ app.get("/aggregated-stats", async (req, res) => {
 
         // Prepare for update of redis cache
         const newEtag = reposDataObj.headers.etag;
-        newEtagsPageNumList.push([newEtag, ""+i].join("="));
+        newEtagsPageNumList.push([newEtag, "" + i].join("="));
         newEachEtagPageHash[newEtag] = reposDataObj.data;
 
         // update aggregate data
-        [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] = processReposDataObj(
-          reposDataObj,
-          {
+        [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] =
+          await processReposDataObj(reposDataObj, {
             reposCount,
             stargazersTotalCount,
             forksTotalCount,
             totalRepoSize,
             langList,
-          }
-        );
+          });
       }
     }
   }
 
   console.log("* BIG BRANCHES DONE => BEFORE avgRepoSize");
+
+  console.log("newEtagsPageNumList :", newEtagsPageNumList);
+  // console.log("newEachEtagPageHash :", newEachEtagPageHash);
+  fs.writeFileSync("./newEachEtagPageHash.json", JSON.stringify(newEachEtagPageHash), (err) => {});
 
   // Compute the average repo size
   avgRepoSize = getAvgRepoSize(totalRepoSize, reposCount);

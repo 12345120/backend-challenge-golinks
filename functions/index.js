@@ -11,11 +11,6 @@ const PER_PAGE = 100;
 // On Firebase, env vars will be applied
 dotenv.config();
 
-console.log(
-  "*** ENV VAR: GITHUB_PERSONAL_ACCESS_TOKEN => ",
-  process.env.GITHUB_PERSONAL_ACCESS_TOKEN
-);
-
 // Initialize App
 const app = express();
 

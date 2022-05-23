@@ -23,14 +23,18 @@ const app = express();
 app.use(cors({ origin: "*" }));
 
 function simplifyFork(forkStr) {
-  let fork = forkStr.toLowerCase();
-  if (fork === "false" || fork === undefined || fork === null) {
-    fork = false;
-  } else if (fork === "true") {
-    fork = true;
+  if (forkStr === undefined || forkStr === null) {
+    return true;
   }
 
-  return fork;
+  let fork = forkStr.toLowerCase();
+  if (fork === "false") {
+    return false;
+  } else if (fork === "true") {
+    return true;
+  }
+
+  return forkStr;
 }
 
 function validateQueryParams(username, fork) {
@@ -88,9 +92,7 @@ async function processReposData(repos, aggregateValues, fork) {
     aggregateValues;
 
   for (const repo of repos) {
-    console.log("--- REPO --- (name: " + repo.name + ")");
     if (fork === false && repo.fork === true) {
-      console.log("! FORK => set to FALSE, skip this forked repo !");
       continue;
     }
 
@@ -112,7 +114,6 @@ async function processReposData(repos, aggregateValues, fork) {
 
     // Populate langList by iterating through languesObj
     for (const [name, count] of Object.entries(languagesObj)) {
-      console.log("       * LOOP => (name, count): (" + name + ", " + count + ")");
       const langMatchIndex = langList.findIndex((lang) => lang.name === name);
 
       // language is not found in langList
@@ -181,8 +182,6 @@ app.get("/aggregated-stats", async (req, res) => {
 
   // Prevent value of fork from being "undefined" or "null" or other values
   fork = simplifyFork(fork);
-  console.log("username => ", username);
-  console.log("fork => ", fork);
 
   // Validate query parameters
   const { valid: queryParamsIsValid, errMsg } = validateQueryParams(username, fork);
@@ -221,7 +220,6 @@ app.get("/aggregated-stats", async (req, res) => {
 
   // Get remaining pages
   for (let i = 2; i <= lastPageNum; i++) {
-    console.log("   @ LOOP @")
     let github_API_repos_URL = `https://api.github.com/users/${username}/repos?per_page=${PER_PAGE}&page=${i}`;
     let reposDataObj = await getReposDataObj(github_API_repos_URL, null);
 
@@ -238,8 +236,6 @@ app.get("/aggregated-stats", async (req, res) => {
       fork
     );
   }
-
-  console.log("* BIG BRANCHES DONE => BEFORE avgRepoSize");
 
   // Compute the average repo size
   avgRepoSize = getAvgRepoSize(totalRepoSize, reposCount);

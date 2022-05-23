@@ -357,6 +357,7 @@ app.get("/aggregated-stats", async (req, res) => {
     }
     // At least one of the pages is NOT up to date. Renew the cache and return updated content
     else {
+      // TODO: repos might have been REMOVED instead of ADDED, so check for that as well
       if (prevPageNum != lastPageNum) {
         for (let i = prevPageNum + 1; i <= lastPageNum; i++) {
           let github_API_repos_URL = `https://api.github.com/users/${username}/repos?per_page=${PER_PAGE}&page=${i}`;
@@ -411,6 +412,8 @@ app.get("/aggregated-stats", async (req, res) => {
       }
     );
 
+    
+    
     // Check if more pages have to be fetched
     if (reposDataObj.headers.link !== undefined) {
       // Get last page number

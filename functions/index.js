@@ -1,11 +1,8 @@
-import express, { response } from "express";
+import express from "express";
 import cors from "cors";
-import { createClient } from "redis";
 import axios from "axios";
 import dotenv from "dotenv";
 import { https } from "firebase-functions";
-
-import fs from "fs";
 
 // CONSTANTS
 const PER_PAGE = 100;
@@ -14,22 +11,26 @@ const PER_PAGE = 100;
 // On Firebase, env vars will be applied
 dotenv.config();
 
-// Initialize Redis client
-const redisClient = createClient({
-  url: "redis://redis-14437.c62.us-east-1-4.ec2.cloud.redislabs.com:14437",
-  password: "fofsW2tllOxblIdFsHylohfBSagsYA2y",
-});
-
-// Connect to redis instance
-(async () => {
-  await redisClient.connect();
-})();
-
 // Initialize App
 const app = express();
 
 // Middlewares
 app.use(cors({ origin: "*" }));
+
+function simplifyFork(forkStr) {
+  if (forkStr === undefined || forkStr === null) {
+    return true;
+  }
+
+  let fork = forkStr.toLowerCase();
+  if (fork === "false") {
+    return false;
+  } else if (fork === "true") {
+    return true;
+  }
+
+  return forkStr;
+}
 
 function validateQueryParams(username, fork) {
   // username value is invalid
@@ -41,38 +42,26 @@ function validateQueryParams(username, fork) {
   }
 
   // fork value is invalid
-  if (fork !== undefined && fork !== null && fork !== true && fork !== false) {
+  if (!(fork === undefined || fork === null || fork === true || fork === false)) {
     return {
       valid: false,
-      errMsg: "ERROR: Invalid username value",
+      errMsg: "ERROR: Invalid fork value",
     };
   }
 
   return { valid: true };
 }
 
-function simplifyFork(fork) {
-  if (fork === undefined || fork === null || fork === true) {
-    return true;
-  }
-
-  return false;
-}
-
-async function getReposDataObj(URL, etag) {
+async function getReposDataObj(URL) {
   const reposDataObj = await axios({
     url: URL,
     method: "GET",
     headers: {
       Authorization: process.env.GITHUB_PERSONAL_ACCESS_TOKEN,
-      "If-None-Match": etag == null ? "" : etag,
     },
   }).catch((error) => {
-    if (error.response.status === 304) {
-      // Not Modified
-      return 304;
-    } else if (error.response.status === 404) {
-      // Not Found
+    // Not Found
+    if (error.response.status === 404) {
       return 404;
     }
   });
@@ -90,47 +79,22 @@ function checkForBadRequest(axiosResponse) {
 }
 
 function sendBadRequestResponse(res) {
-  res.status(400).send("ERROR: Username doesn't exist");
+  res.status(400).send("ERROR: username doesn't exist");
 }
 
-async function checkForNotModified(axiosResponse) {
-  let notModified = false;
-  if (axiosResponse === 304) {
-    notModified = true;
-  }
-
-  return notModified;
-}
-
-async function sendCachedResults(username_fork_key, res) {
-  // Get previously cached response object
-  const responseObj = await redisClient
-    .GET(username_fork_key)
-    .then((data) => JSON.parse(data))
-    .catch((error) => console.error("REDIS ERROR: ", error));
-
-  res.status(200).json(responseObj);
-}
-
-async function processReposData(repos, aggregateValues) {
-  console.log("^^^ processReposData");
-
+async function processReposData(repos, aggregateValues, fork) {
   let { reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize, langList } =
     aggregateValues;
 
-  console.log(typeof repos);
-  console.log(" * repos: ", repos);
-  console.log("\n");
-
   for (const repo of repos) {
+    if (fork === false && repo.fork === true) {
+      continue;
+    }
+
     reposCount += 1;
     stargazersTotalCount += repo["stargazers_count"];
     forksTotalCount += repo["forks_count"];
     totalRepoSize += repo["size"];
-
-    console.log('repo["stargazers_count"]: ', repo["stargazers_count"]);
-    console.log('repo["forks_count"]: ', repo["forks_count"]);
-    console.log('repo["size"]: ', repo["size"]);
 
     // Get languages
     const { data: languagesObj } = await axios({
@@ -145,7 +109,6 @@ async function processReposData(repos, aggregateValues) {
 
     // Populate langList by iterating through languesObj
     for (const [name, count] of Object.entries(languagesObj)) {
-      console.log("       * LOOP => (name, count): (" + name + ", " + count + ")");
       const langMatchIndex = langList.findIndex((lang) => lang.name === name);
 
       // language is not found in langList
@@ -167,25 +130,17 @@ async function processReposData(repos, aggregateValues) {
   return [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize];
 }
 
-async function processReposDataObj(reposDataObj, aggregateValues) {
-  console.log("^^^ processReposDataObj");
-
+async function processReposDataObj(reposDataObj, aggregateValues, fork) {
   const repos = reposDataObj.data;
-  return await processReposData(repos, aggregateValues);
+  return await processReposData(repos, aggregateValues, fork);
 }
 
-async function processCachedReposData(username_fork_key, cachedEtag, aggregateValues) {
-  console.log("^^^ processCachedReposData");
-  
-  // TODO: problem with etag => HASH doesn't recognize etag, probably bc of the weird format
-  // TODO: when storing etags, strip the ""'s and \ and stuff 
+function getLastPageNum(reposDataObj) {
+  const pageRegexMatches = reposDataObj.headers.link.match(/page=\d*/g);
+  const lastPageStr = pageRegexMatches[pageRegexMatches.length - 1];
+  const lastPageNum = lastPageStr.split("=")[1];
 
-  const cachedReposData = await redisClient
-    .HGET(username_fork_key + "-" + "HASH", cachedEtag)
-    .then((data) => JSON.parse(data))
-    .catch((error) => console.error("REDIS ERROR: ", error));
-
-  return await processReposData(cachedReposData, aggregateValues);
+  return lastPageNum;
 }
 
 function getAvgRepoSize(totalRepoSize, reposCount) {
@@ -206,42 +161,8 @@ function getAvgRepoSize(totalRepoSize, reposCount) {
   return avgRepoSize;
 }
 
-async function renewAllCache(
-  username_fork_key,
-  newEtagsPageNumList,
-  newEachEtagPageHash,
-  newResponseObj
-) {
-  // renew etag=page number LIST
-  await redisClient
-    .DEL(username_fork_key + "-" + "LIST")
-    .catch((error) => console.error("REDIS ERROR: ", error));
-
-  for (const etagsPageNumPair of newEtagsPageNumList) {
-    await redisClient
-      .RPUSH(username_fork_key + "-" + "LIST", JSON.stringify(etagsPageNumPair))
-      .catch((error) => console.error("REDIS ERROR: ", error));
-  }
-
-  // renew etag: reposPage HASH
-  await redisClient
-    .DEL(username_fork_key + "-" + "HASH")
-    .catch((error) => console.error("REDIS ERROR: ", error));
-  for (const [key, value] of Object.entries(newEachEtagPageHash)) {
-    await redisClient
-      .HSET(username_fork_key + "-" + "HASH", JSON.stringify(key), JSON.stringify(value))
-      .catch((error) => console.error("REDIS ERROR: ", error));
-  }
-
-  // renew response object
-  await redisClient
-    .SET(username_fork_key, JSON.stringify(newResponseObj))
-    .catch((error) => console.error("REDIS ERROR: ", error));
-}
-
 // Get the aggregated Statistics across all repositories of given user
 app.get("/aggregated-stats", async (req, res) => {
-  console.log("* START OF APPLICATION");
   // Get query params
   const username = req.query.username;
   let fork = req.query.fork;
@@ -254,9 +175,8 @@ app.get("/aggregated-stats", async (req, res) => {
   let totalRepoSize = 0;
   let langList = [];
 
-  // New cache data
-  let newEtagsPageNumList = [];
-  let newEachEtagPageHash = {};
+  // Prevent value of fork from being "undefined" or "null" or other values
+  fork = simplifyFork(fork);
 
   // Validate query parameters
   const { valid: queryParamsIsValid, errMsg } = validateQueryParams(username, fork);
@@ -264,141 +184,39 @@ app.get("/aggregated-stats", async (req, res) => {
     return res.status(400).send(errMsg);
   }
 
-  // Prevent value of fork from being "undefined" or "null"
-  fork = simplifyFork(fork);
+  let lastPageNum = 1;
+  let github_API_repos_URL = `https://api.github.com/users/${username}/repos?per_page=${PER_PAGE}&page=${1}`;
+  let reposDataObj = await getReposDataObj(github_API_repos_URL, null);
 
-  // Construct redis key (to store as cache) & github API URL
-  const username_fork_key = [username, fork].join(", ");
+  // Check for 404: Bad Request
+  let badRequest = checkForBadRequest(reposDataObj);
+  if (badRequest) {
+    return sendBadRequestResponse(res);
+  }
 
-  // Get etag value from redis, if there is one
-  const cachedEtagsPageNumList = await redisClient
-    .LRANGE(username_fork_key + "-" + "LIST", 0, -1)
-    .catch((error) => console.error("REDIS ERROR: ", error));
+  // update aggregate data
+  [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] = await processReposDataObj(
+    reposDataObj,
+    {
+      reposCount,
+      stargazersTotalCount,
+      forksTotalCount,
+      totalRepoSize,
+      langList,
+    },
+    fork
+  );
 
-  console.log("* FETCHED cachedEtagsPageNumList from REDIS");
+  // If link header is given, there are more pages to fetch
+  // Get last page number
+  if (reposDataObj.headers.link !== undefined) {
+    lastPageNum = getLastPageNum(reposDataObj);
+  }
 
-  // Check if any of the cached etags results in a NO MATCH
-  // If yes, the page of repos associated with that etag needs to be refetched
-  let allReposEntirelyUpToDate = true;
-  let lastPageNum = 0;
-  let prevPageNum = 0;
-  if (cachedEtagsPageNumList.length != 0) {
-    console.log("*** cachedEtagsPageNumList.length != 0");
-
-    for (const cachedEtagPageNum of cachedEtagsPageNumList) {
-      const cachedEtag = cachedEtagPageNum.split("=")[0];
-      const cachedPageNum = cachedEtagPageNum.split("=")[1];
-
-      let github_API_repos_URL = `https://api.github.com/users/${username}/repos?per_page=${PER_PAGE}&page=${cachedPageNum}`;
-      let reposDataObj = await getReposDataObj(github_API_repos_URL, cachedEtag);
-
-      // Check for 404: Bad Request
-      let badRequest = checkForBadRequest(reposDataObj);
-      if (badRequest) {
-        return sendBadRequestResponse();
-      }
-
-      prevPageNum = cachedPageNum;
-      // Get last page number
-      if (cachedPageNum === 1) {
-        const pageRegexMatches = reposDataObj.headers.link.match(/page=\d*/g);
-        const lastPageStr = pageRegexMatches[pageRegexMatches.length - 1];
-        lastPageNum = lastPageStr.split("=")[1];
-      }
-
-      // Check for 304: Not Modified
-      let contentUpToDate = checkForNotModified(reposDataObj);
-      if (!contentUpToDate) {
-        console.log("   * Content NOT up to date");
-        allReposEntirelyUpToDate = false;
-
-        // Prepare for update of redis cache
-        const newEtag = reposDataObj.headers.etag;
-        newEtagsPageNumList.push([newEtag, cachedPageNum].join("="));
-        newEachEtagPageHash[newEtag] = reposDataObj.data;
-
-        // update aggregate data
-        [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] =
-          await processReposDataObj(reposDataObj, {
-            reposCount,
-            stargazersTotalCount,
-            forksTotalCount,
-            totalRepoSize,
-            langList,
-          });
-      } else if (contentUpToDate) {
-        console.log("   * Content up to date");
-        console.log("   * Cached Etag: ", cachedEtag);
-
-        // Prepare for update of redis cache
-        newEtagsPageNumList.push([cachedEtag, cachedPageNum].join("="));
-        newEachEtagPageHash[cachedEtag] = await redisClient
-          .HGET(username_fork_key + "-" + "HASH", cachedEtag)
-          .then((data) => JSON.parse(data))
-          .catch((error) => console.error("REDIS ERROR: ", error));
-
-        // update aggregate data
-        [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] =
-          await processCachedReposData(username_fork_key, cachedEtag, {
-            reposCount,
-            stargazersTotalCount,
-            forksTotalCount,
-            totalRepoSize,
-            langList,
-          });
-      }
-    } // END OF cachedEtagsPageNumList.forEach()
-
-    // All repos across all pages are up to date. Everything can be returned from the cache
-    if (allReposEntirelyUpToDate) {
-      console.log("***** allReposEntirelyUpToDate");
-
-      return sendCachedResults(username_fork_key, res);
-    }
-    // At least one of the pages is NOT up to date. Renew the cache and return updated content
-    else {
-      // TODO: repos might have been REMOVED instead of ADDED, so check for that as well
-      if (prevPageNum != lastPageNum) {
-        for (let i = prevPageNum + 1; i <= lastPageNum; i++) {
-          let github_API_repos_URL = `https://api.github.com/users/${username}/repos?per_page=${PER_PAGE}&page=${i}`;
-          let reposDataObj = await getReposDataObj(github_API_repos_URL, null);
-
-          // Prepare for update of redis cache
-          const newEtag = reposDataObj.headers.etag;
-          newEtagsPageNumList.push([newEtag, "" + i].join("="));
-          newEachEtagPageHash[newEtag] = reposDataObj.data;
-
-          // update aggregate data
-          [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] =
-            await processReposDataObj(reposDataObj, {
-              reposCount,
-              stargazersTotalCount,
-              forksTotalCount,
-              totalRepoSize,
-              langList,
-            });
-        }
-      }
-    } // END OF allReposEntirelyUpToDate == false
-  } // END OF cachedEtagsList != null
-  else if (cachedEtagsPageNumList.length == 0) {
-    console.log("*** cachedEtagsPageNumList.length == 0");
-
-    allReposEntirelyUpToDate = false;
-
-    let github_API_repos_URL = `https://api.github.com/users/${username}/repos?per_page=${PER_PAGE}&page=${1}`;
+  // Get remaining pages
+  for (let i = 2; i <= lastPageNum; i++) {
+    let github_API_repos_URL = `https://api.github.com/users/${username}/repos?per_page=${PER_PAGE}&page=${i}`;
     let reposDataObj = await getReposDataObj(github_API_repos_URL, null);
-
-    // Check for 404: Bad Request
-    let badRequest = checkForBadRequest(reposDataObj);
-    if (badRequest) {
-      return sendBadRequestResponse();
-    }
-
-    // Prepare for update of redis cache
-    const newEtag = reposDataObj.headers.etag;
-    newEtagsPageNumList.push([newEtag, "1"].join("="));
-    newEachEtagPageHash[newEtag] = reposDataObj.data;
 
     // update aggregate data
     [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] = await processReposDataObj(
@@ -409,46 +227,10 @@ app.get("/aggregated-stats", async (req, res) => {
         forksTotalCount,
         totalRepoSize,
         langList,
-      }
+      },
+      fork
     );
-
-    
-    
-    // Check if more pages have to be fetched
-    if (reposDataObj.headers.link !== undefined) {
-      // Get last page number
-      const pageRegexMatches = reposDataObj.headers.link.match(/page=\d*/g);
-      const lastPageStr = pageRegexMatches[pageRegexMatches.length - 1];
-      lastPageNum = lastPageStr.split("=")[1];
-
-      for (let i = 2; i <= lastPageNum; i++) {
-        console.log("***** LOOP: remaining pages");
-        let github_API_repos_URL = `https://api.github.com/users/${username}/repos?per_page=${PER_PAGE}&page=${i}`;
-        let reposDataObj = await getReposDataObj(github_API_repos_URL, null);
-
-        // Prepare for update of redis cache
-        const newEtag = reposDataObj.headers.etag;
-        newEtagsPageNumList.push([newEtag, "" + i].join("="));
-        newEachEtagPageHash[newEtag] = reposDataObj.data;
-
-        // update aggregate data
-        [reposCount, stargazersTotalCount, forksTotalCount, totalRepoSize] =
-          await processReposDataObj(reposDataObj, {
-            reposCount,
-            stargazersTotalCount,
-            forksTotalCount,
-            totalRepoSize,
-            langList,
-          });
-      }
-    }
   }
-
-  console.log("* BIG BRANCHES DONE => BEFORE avgRepoSize");
-
-  console.log("newEtagsPageNumList :", newEtagsPageNumList);
-  // console.log("newEachEtagPageHash :", newEachEtagPageHash);
-  fs.writeFileSync("./newEachEtagPageHash.json", JSON.stringify(newEachEtagPageHash), (err) => {});
 
   // Compute the average repo size
   avgRepoSize = getAvgRepoSize(totalRepoSize, reposCount);
@@ -458,6 +240,7 @@ app.get("/aggregated-stats", async (req, res) => {
     return b.count - a.count;
   });
 
+  // construct to-be-returned data
   const responseObj = {
     reposCount,
     stargazersTotalCount,
@@ -465,11 +248,6 @@ app.get("/aggregated-stats", async (req, res) => {
     avgRepoSize,
     langList,
   };
-
-  if (!allReposEntirelyUpToDate) {
-    // Renew all redis cache
-    renewAllCache(username_fork_key, newEtagsPageNumList, newEachEtagPageHash, responseObj);
-  }
 
   return res.status(200).json(responseObj);
 });
